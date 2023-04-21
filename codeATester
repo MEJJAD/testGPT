@@ -1,0 +1,1142 @@
+/*****************************************************************************
+* Product:  AS7100Plus V1.0
+* File: duplex.c
+* Last Updated for Version: 0.1.00
+* Date of the Last Update:  December 22, 2014
+*
+*                    E L E C T R O N I C   I N N O V A T I O N
+*                    -----------------------------------------
+*                     innovating       embedded       systems
+*
+* Copyright (C) 2001-2014 Electronic Innovation, SARL. All rights reserved.
+*
+* Contact information:
+* Electronic Innovation Web site:  http://www.mejjad-electronics.com
+* e-mail:                          commercial@mejjad-electronics.com
+*****************************************************************************/
+#include "qpc.h"
+#include "qassert.h"
+#include "bsp.h"
+#include "lift_cfg.h"
+#include "liftCore.h"
+#include "myRoutines.h"
+#include "CANopen.h"
+#include "duplex.h"
+#include <string.h>
+
+//Q_DEFINE_THIS_FILE
+
+/*
+***********************************************************************************************************************
+*                         duplex state machine 
+*
+* NOTES IMPORTANTES:
+*   La machine reçoit les appels externes directement disponibles sur les boutons et génère les appels 
+*   paliers  affectés à chaque appreil.
+*   Les appels externes proviennent des E/S de la carte ou du réseau. Les données provenant des E/S sont
+*   formatées mais les données provenant du réseau ne le sont pas 
+***********************************************************************************************************************
+*/
+
+                                               /*..... helper functions .....*/
+void    scr_cancelCall           (Duplex_t *me);
+int8_t  getDuplexState           (Duplex_t *me);
+uint8_t verifBas_                (uint32_t appel, uint32_t pEtage);
+uint8_t verifHaut_               (uint32_t appel, uint32_t pEtage);
+void    affecterAppel            (uint32_t *appel, uint32_t appelExterne, 
+                                  uint8_t *distanceA, uint8_t *distanceB, 
+                                  uint8_t tailleA, uint8_t tailleB, 
+                                  uint8_t l_id_A, uint8_t l_id_B,
+                                  uint8_t l_shift_A, uint8_t l_shift_B);
+void evaluerDistance             (Duplex_t *me, const DataAsc *pdata_t,/* parametre de l'ascenseur */
+                                  uint8_t distance[], uint8_t palierX); 
+//static void scr_setCallPDO1      (Duplex *me, uint32_t appelDescente);
+//static void scr_setCallPDO3      (Duplex *me, uint32_t appelMontee);
+
+
+
+								                  /*..... state machine .....*/
+static QState Duplex_initial     (Duplex_t *me, QEvent const *e);
+static QState Duplex_main        (Duplex_t *me, QEvent const *e);
+
+
+/*...................... Duplex .............................................*/
+void Duplex_ctor(Duplex_t *me, LiftCore_t *father_, Call *friend_) {
+    QHsm_ctor(&me->super_, (QStateHandler)&Duplex_initial);  /*superclass' ctor */
+    me->lift = father_;
+    me->call = friend_;
+}
+
+/*................. Duplex initial ..........................................*/
+QState Duplex_initial(Duplex_t *me, QEvent const *e) {
+    return Q_TRAN(&Duplex_main);
+}
+
+/*...................... duplex main ........................................*/
+QState Duplex_main(Duplex_t *me, QEvent const *e) {
+    switch (e->sig) {
+        case Q_ENTRY_SIG: {
+            me->duplex_state = DUPLEX_OFF_;
+            me->duplex_prio  = Parameters.duplexPrio.val;
+            me->duplex_cntr  = (uint8_t)10;
+            me->shift_A      = (uint8_t)0;
+            me->shift_B      = (uint8_t)0;
+            (void)memset(me->distance_AD, 0xFF, MAX_APPEL);
+            (void)memset(me->distance_BD, 0xFF, MAX_APPEL);
+            (void)memset(me->distance_AM, 0xFF, MAX_APPEL);
+            (void)memset(me->distance_BM, 0xFF, MAX_APPEL);
+            me->dataAscenseur_B.appelCabine_ = (uint32_t)0;
+            me->dataAscenseur_B.appelPalierMontee_ = (uint32_t)0;
+            me->dataAscenseur_B.appelPalierDescente_ = (uint32_t)0;
+            me->dataAscenseur_B.etage_ = (uint32_t)1;
+            me->dataAscenseur_B.phase_ = (uint8_t)REVISION_;
+            me->dataAscenseur_B.direction_ = (uint8_t)STOP_;
+            me->dataAscenseur_B.niveauZero_ = (uint8_t)1;
+            me->dataAscenseur_B.nbreDeNiveaux_ = (uint8_t)16;            
+            return Q_HANDLED();
+        }
+        /*..... duplexOnCall .....*/
+        case RPDO1_DPLX_SIG: {
+            uint32_t appelDescente_B;
+            if ((me->lift)->phase != PATINAGE_) {
+                //me->dataAscenseur_B.appelCabine_ = *(uint32_t *)&((CANOpenEvt *)e)->buffer_[0];
+                me->dataAscenseur_B.appelCabine_ = ((CANOpenEvt *)e)->buffer_[0] | (((CANOpenEvt *)e)->buffer_[1] << 8) \
+                                                   | (((CANOpenEvt *)e)->buffer_[2] << 16) | (((CANOpenEvt *)e)->buffer_[3] << 24);
+                //appelDescente_B = *(uint32_t *)&((CANOpenEvt *)e)->buffer_[4];
+                appelDescente_B = ((CANOpenEvt *)e)->buffer_[4] | (((CANOpenEvt *)e)->buffer_[5] << 8) \
+                                  | (((CANOpenEvt *)e)->buffer_[6] << 16) | (((CANOpenEvt *)e)->buffer_[7] << 24);
+                (me->call)->appelExterneDescente |= (appelDescente_B >> me->shift_A);
+                //scr_setCallPDO3 (me, appelDescente_B);
+            }	
+            if (me->duplex_cntr > 1) {
+                me->duplex_cntr -= 2;
+            } else {
+                me->duplex_cntr = 0;
+            }
+            return Q_HANDLED();
+        }     
+        /*..... duplexOnInfo .....*/        
+        case RPDO2_DPLX_SIG: {
+            uint8_t l_niveauZero_A;
+            //(me->dataAscenseur_B).etage_ = *(uint32_t *)&((CANOpenEvt *)e)->buffer_[0];
+            (me->dataAscenseur_B).etage_ = ((CANOpenEvt *)e)->buffer_[0] | (((CANOpenEvt *)e)->buffer_[1] << 8) \
+                                           | (((CANOpenEvt *)e)->buffer_[2] << 16) | (((CANOpenEvt *)e)->buffer_[3] << 24);
+            (me->dataAscenseur_B).phase_ = ((CANOpenEvt *)e)->buffer_[4];
+            (me->dataAscenseur_B).direction_ = ((CANOpenEvt *)e)->buffer_[5];
+            (me->dataAscenseur_B).niveauZero_ = ((CANOpenEvt *)e)->buffer_[6];
+            (me->dataAscenseur_B).nbreDeNiveaux_ = ((CANOpenEvt *)e)->buffer_[7];
+            
+            l_niveauZero_A = Parameters.etageLePlusBas;
+            if ((me->dataAscenseur_B).niveauZero_ > l_niveauZero_A) {
+                me->shift_B = (me->dataAscenseur_B).niveauZero_ - l_niveauZero_A;
+                me->shift_A = (uint8_t)0;
+            } else {
+                me->shift_A = l_niveauZero_A - (me->dataAscenseur_B).niveauZero_;
+                me->shift_B = (uint8_t)0;
+            }
+
+            if (me->duplex_cntr > 1) {		   
+                me->duplex_cntr -= 2;
+            } else {
+                me->duplex_cntr = 0;
+            }            
+            return Q_HANDLED();
+        }
+        /*..... duplexOnCall appelMontee .....*/
+        case RPDO3_DPLX_SIG: {
+            uint32_t appelMontee_B;
+            if ((me->lift)->phase != PATINAGE_) {
+                appelMontee_B = ((CANOpenEvt *)e)->buffer_[0] | (((CANOpenEvt *)e)->buffer_[1] << 8) \
+                                | (((CANOpenEvt *)e)->buffer_[2] << 16) | (((CANOpenEvt *)e)->buffer_[3] << 24);
+                (me->call)->appelExterneMontee |= (appelMontee_B >> me->shift_A);
+            }	
+            if (me->duplex_cntr > 1) {
+                me->duplex_cntr -= 2;
+            } else {
+                me->duplex_cntr = 0;
+            }
+            return Q_HANDLED();
+        } 
+        
+        case TIME_TICK_SIG: {
+            CANOpenEvt *pe;
+ /* test si la reception sur CAN1(connexion multiplex) marche convenablement */            
+            if (me->duplex_cntr++ >= DUPLEX_CNTR_MAX_) {
+                me->duplex_state = DUPLEX_OFF_;
+                me->duplex_cntr  = DUPLEX_CNTR_MAX_;
+            } else {
+                if (me->duplex_cntr <= DUPLEX_CNTR_MIN_) {
+                    me->duplex_state = DUPLEX_ON_;
+                }
+            }
+			
+            (me->dataAscenseur_A).id_                  = (uint8_t)Parameters.duplexPrio.val;
+            (me->dataAscenseur_A).appelCabine_         = ((me->call)->appelCabine) << me->shift_A;	
+            (me->dataAscenseur_A).appelPalierMontee_   = ((me->call)->appelPalierMontee) << me->shift_A;
+            (me->dataAscenseur_A).appelPalierDescente_ = ((me->call)->appelPalierDescente) << me->shift_A;
+            (me->dataAscenseur_A).etage_               = ((me->lift)->etage) << me->shift_A;
+            (me->dataAscenseur_A).direction_           = (me->lift)->direction;
+            (me->dataAscenseur_A).phase_               = (me->lift)->phase;
+            (me->dataAscenseur_A).nbreDeNiveaux_       = Parameters.nbreDeNiveaux.val + me->shift_A;
+            (me->dataAscenseur_A).niveauZero_          = Parameters.etageLePlusBas;
+            me->appelExterneMontee_dplx                = ((me->call)->appelExterneMontee << me->shift_A);
+            me->appelExterneDescente_dplx              = ((me->call)->appelExterneDescente << me->shift_A);
+			
+/*..... si pas de communication ou l'autre appareil a un pb ou en phase .....*/
+    /*..... de revision donc tous les appels palier sont pris en compte .....*/	    
+            if (getDuplexState(me) == PB_IN_DUPLEX_) {   
+                (me->dataAscenseur_A).appelPalierMontee_   = me->appelExterneMontee_dplx;
+                (me->dataAscenseur_A).appelPalierDescente_ = me->appelExterneDescente_dplx;
+    	    } else { 
+      /* pas besoin de faire des calculs si nous sommes dans la phase revision 
+                                                                 ou patinage */
+                if (((me->dataAscenseur_A).phase_ != REVISION_) \
+                     && ((me->dataAscenseur_A).phase_ != PATINAGE_)) {
+                                               /* Traitement des annulations */
+        		                                         /* Duplex B */
+                    if (((me->dataAscenseur_B).phase_ == ARRIVEE_) \
+                         || ((me->dataAscenseur_B).phase_ == RALENTI_) \
+                         || ((me->dataAscenseur_B).phase_ == ARRIVEE_PERSONNE_)) {
+                        if ((me->dataAscenseur_B).direction_ == UP_) {
+                            me->annulExterneMontee_dplx = ~(me->dataAscenseur_B).etage_;
+                            me->appelExterneMontee_dplx &= me->annulExterneMontee_dplx;
+                            if ((verifHaut_(((me->dataAscenseur_B).appelCabine_ \
+                                             | me->appelExterneDescente_dplx \
+                                             | me->appelExterneMontee_dplx), \
+                                            (me->dataAscenseur_B).etage_) == 0) \
+                                 || ((me->dataAscenseur_B).etage_ \
+                                      == (((uint32_t)1 << Parameters.nbreDeNiveaux.val) - 1))) {
+                                me->annulExterneDescente_dplx = ~(me->dataAscenseur_B).etage_;
+                                me->appelExterneDescente_dplx &= me->annulExterneDescente_dplx;
+                            }
+                        } else {
+                            me->annulExterneDescente_dplx = ~(me->dataAscenseur_B).etage_;
+                            me->appelExterneDescente_dplx &= me->annulExterneDescente_dplx;
+                            if ((verifBas_(((me->dataAscenseur_B).appelCabine_ \
+                                             | (me->appelExterneMontee_dplx) \
+                                             | (me->appelExterneDescente_dplx)), \
+                                            (me->dataAscenseur_B).etage_) == 0) \
+                               || ((me->dataAscenseur_B).etage_ == (uint32_t)1)) {
+                                me->annulExterneMontee_dplx = ~(me->dataAscenseur_B).etage_;
+                                me->appelExterneMontee_dplx &= me->annulExterneMontee_dplx;
+                            }
+                        }
+                        scr_cancelCall(me);
+                    }            	
+                                           /* Fin Traitement des annulations */
+                                           
+                    (me->dataAscenseur_A).id_ = me->duplex_prio;
+                    if (me->duplex_prio == DUPLEX_SLAVE_) {
+                        (me->dataAscenseur_B).id_ = DUPLEX_MASTER_;
+                    } else {
+                        (me->dataAscenseur_B).id_ = DUPLEX_SLAVE_;
+                    }
+    
+                    if (me->appelExterneDescente_dplx \
+                        || me->appelExterneMontee_dplx \
+                        || (me->dataAscenseur_A).appelPalierDescente_ \
+                        || (me->dataAscenseur_A).appelPalierMontee_) {
+              /* evaluation des distances de l'appareil A par rapport aux appels */
+                        evaluerDistance(me, &(me->dataAscenseur_A), me->distance_AD, PALIER_D_);
+                        evaluerDistance(me, &(me->dataAscenseur_A), me->distance_AM, PALIER_M_);
+              /* evaluation des distances de l'appareil B par rapport aux appels */
+                        evaluerDistance(me, &(me->dataAscenseur_B), me->distance_BD, PALIER_D_);
+                        evaluerDistance(me, &(me->dataAscenseur_B), me->distance_BM, PALIER_M_);
+                                    /* affectations des appels a l'un et l'autre */
+                        affecterAppel(&((me->dataAscenseur_A).appelPalierDescente_), 
+                                      me->appelExterneDescente_dplx, 
+                                      me->distance_AD, 
+                                      me->distance_BD, 
+                                      (me->dataAscenseur_A).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_B).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_A).id_, 
+                                      (me->dataAscenseur_B).id_,
+                                      me->shift_A,
+                                      me->shift_B);
+                        affecterAppel(&((me->dataAscenseur_A).appelPalierMontee_), 
+                                      me->appelExterneMontee_dplx, 
+                                      me->distance_AM, 
+                                      me->distance_BM, 
+                                      (me->dataAscenseur_A).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_B).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_A).id_, 
+                                      (me->dataAscenseur_B).id_,
+                                      me->shift_A,
+                                      me->shift_B);        		
+                        affecterAppel(&((me->dataAscenseur_B).appelPalierDescente_), 
+                                      me->appelExterneDescente_dplx, 
+                                      me->distance_BD, 
+                                      me->distance_AD, 
+                                      (me->dataAscenseur_B).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_A).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_B).id_, 
+                                      (me->dataAscenseur_A).id_,
+                                      me->shift_B,
+                                      me->shift_A);
+                       affecterAppel(&((me->dataAscenseur_B).appelPalierMontee_), 
+                                      me->appelExterneMontee_dplx, 
+                                      me->distance_BM, 
+                                      me->distance_AM, 
+                                      (me->dataAscenseur_B).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_A).nbreDeNiveaux_, 
+                                      (me->dataAscenseur_B).id_, 
+                                      (me->dataAscenseur_A).id_,
+                                      me->shift_B,
+                                      me->shift_A);
+                    }
+                }
+    	    }
+            (me->call)->appelPalierMontee   = (me->dataAscenseur_A).appelPalierMontee_ >> me->shift_A;
+            (me->call)->appelPalierDescente = (me->dataAscenseur_A).appelPalierDescente_ >> me->shift_A;
+			
+            if (((me->dataAscenseur_A).phase_ != REVISION_) \
+                  && ((me->dataAscenseur_A).phase_ != PATINAGE_) \
+                  && ((me->dataAscenseur_A).phase_ != PARAMETRAGE_)) {
+            /*..... duplexCall .....*/
+                pe = Q_NEW(CANOpenEvt, TPDO1_DPLX_SIG);
+                pe->buffer_[0] = (uint8_t)((me->dataAscenseur_A).appelCabine_);
+                pe->buffer_[1] = (uint8_t)((me->dataAscenseur_A).appelCabine_ >> 8);
+                pe->buffer_[2] = (uint8_t)((me->dataAscenseur_A).appelCabine_ >> 16);
+                pe->buffer_[3] = (uint8_t)((me->dataAscenseur_A).appelCabine_ >> 24);
+                pe->buffer_[4] = (uint8_t)(me->appelExterneDescente_dplx);
+                pe->buffer_[5] = (uint8_t)(me->appelExterneDescente_dplx >> 8);
+                pe->buffer_[6] = (uint8_t)(me->appelExterneDescente_dplx >> 16);
+                pe->buffer_[7] = (uint8_t)(me->appelExterneDescente_dplx >> 24);
+                QF_PUBLISH((QEvt *)pe, &dummy);
+            /*..... duplexInfo .....*/            
+                pe = Q_NEW(CANOpenEvt, TPDO2_DPLX_SIG);
+                pe->buffer_[0] = (uint8_t)((me->dataAscenseur_A).etage_);
+                pe->buffer_[1] = (uint8_t)((me->dataAscenseur_A).etage_ >> 8);
+                pe->buffer_[2] = (uint8_t)((me->dataAscenseur_A).etage_ >> 16);
+                pe->buffer_[3] = (uint8_t)((me->dataAscenseur_A).etage_ >> 24);
+                if ((me->lift)->duplex_error != ERR_OK) {
+                    pe->buffer_[4] = REVISION_;
+                } else {
+                    pe->buffer_[4] = (me->dataAscenseur_A).phase_;
+                }                
+                pe->buffer_[5] = (me->dataAscenseur_A).direction_;
+                pe->buffer_[6] = (me->dataAscenseur_A).niveauZero_;
+                pe->buffer_[7] = (me->dataAscenseur_A).nbreDeNiveaux_;
+                QF_PUBLISH((QEvt *)pe, &dummy);
+            /*..... duplexCall .....*/
+                pe = Q_NEW(CANOpenEvt, TPDO3_DPLX_SIG);
+                pe->buffer_[0] = (uint8_t)(me->appelExterneMontee_dplx);
+                pe->buffer_[1] = (uint8_t)(me->appelExterneMontee_dplx >> 8);
+                pe->buffer_[2] = (uint8_t)(me->appelExterneMontee_dplx >> 16);
+                pe->buffer_[3] = (uint8_t)(me->appelExterneMontee_dplx >> 24);
+                pe->buffer_[4] = 0;
+                pe->buffer_[5] = 0;
+                pe->buffer_[6] = 0;
+                pe->buffer_[7] = 0;
+                QF_PUBLISH((QEvt *)pe, &dummy);
+            }
+            return Q_HANDLED();
+        }
+        case Q_EXIT_SIG: {
+            return Q_HANDLED();
+        }
+    }
+    return Q_SUPER(&QHsm_top);
+}
+
+/*
+*******************************************************************************
+*
+*    EVALUATION DE LA DISTANCE DES APPELS AFFECTES POUR CHAQUE APPAREIL
+* On suppose que les deux ascenseurs ont le meme etage la plus bas
+* parametres necessaire au calcul du cout sont:
+*		1: Pointeur etage.
+*		2: Les Appels Cabines
+*		3: Les Appels Paliers
+*		4: Le nombre d'etage
+*		5: La direction
+*		6: L'etage le plus bas
+*
+*******************************************************************************
+*/
+
+const uint8_t POIDS = 2;
+void evaluerDistance(Duplex_t *me, const DataAsc *pdata_t,/* parametre de l'ascenseur */
+                     uint8_t distance[], 
+                     uint8_t palierX
+                     ) {
+    uint8_t  cout = 0;			// le cout est initialise a 0
+    uint32_t tEtage = pdata_t->etage_;
+    uint8_t  currentPosition = posToChar_32(pdata_t->etage_);
+    uint8_t  pos = currentPosition;
+    uint8_t  posMax = pdata_t->nbreDeNiveaux_ - 1;
+    uint8_t  state = 'A';
+    int8_t   i;
+
+/*
+*******************************************************************************
+***** 			PalierX == PalierD 				      *
+*******************************************************************************
+*/
+    if (palierX == PALIER_D_) {
+        if (pdata_t->direction_ == UP_) {
+            for (;;) { // L'ascenseur est en montee
+                switch (state) {
+/*
+PalierX 	= PalierD
+Direction 	= Montee
+dans ce cas on effectue une scrutation de la position courante jusqu'a l'appel 
+le plus haut si on rencontre un appel cabine ou Palier Montee on incremente le 
+cout de Poids sinon de cas, une exception est faite si on est au dernier appel,
+dans ce cas on incremente de Poids si un appel cabine ou palier Montee ou 
+Descente affectedCallD et affectedCallU sont les appels effectes, et 
+appelPalierDescente et appelPalierMontee sont les appels enregistres sur les 
+boutons externes
+*/      
+                    case 'A': case 'a': {
+                        if (!verifHaut_((pdata_t->appelCabine_ \
+                                         | me->appelExterneMontee_dplx \
+                                         | me->appelExterneDescente_dplx), tEtage) \
+                                                          || (pos == posMax)) {
+                            if (pos < (MAX_APPEL - 1)) {
+                                for (i = (MAX_APPEL - 1); i > pos; i--) {
+                                    distance[i] = 0xFF;
+                                }
+                            }
+                            if ((tEtage == 1) || (pos == 0)) {
+                                distance[0] = cout;
+                                for (i = (MAX_APPEL - 1); i > 0; i--) {
+                                    distance[i] = 0xFF;
+                                }
+                                state = 'E';
+                            } else {
+                                if (pos > currentPosition) {
+                                    distance[pos] = cout;
+                                    if (tEtage & (pdata_t->appelCabine_ \
+                                                  | pdata_t->appelPalierMontee_ \
+                                                  | pdata_t->appelPalierDescente_)) {
+                                        cout += POIDS;
+                                    } else {
+                                        cout++;
+                                    }
+                                    tEtage >>= 1;
+                                    pos--;
+                                    state = 'B';
+                                } else {
+                                    distance[pos] = cout;
+                                    if ((tEtage == 1) || (pos == 0)) {
+                                        state = 'E';
+                                    } else {
+                                        if (tEtage & (pdata_t->appelPalierDescente_ \
+                                                      | pdata_t->appelCabine_)) {
+                                            cout += POIDS;
+                                        } else {
+                                            cout++;
+                                        }
+                                        tEtage >>= 1;
+                                        pos--;
+                                        state = 'C';
+                                    }
+                                }
+                            }
+                        } else {
+                            if (tEtage & (pdata_t->appelCabine_ \
+                                          | pdata_t->appelPalierMontee_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage <<= 1;
+                            pos++;
+                        }
+                        break;
+                    }
+       
+/*
+PalierX 	= PalierD
+Direction 	= Montee
+dans ce cas on effectue une scrutation de l'etage le plus haut jusqu'a la 
+position courante si on rencontre un appel palierD on incremente le cout 
+de Poids.
+*/        
+                    case 'B': case 'b': {
+                        distance[pos] = cout;
+                        if (pos <= currentPosition) {
+                            if (pos > 0) {
+                                if (tEtage & pdata_t->appelPalierDescente_) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage >>= 1;
+                                pos--;
+                                state = 'C';
+                            } else {
+                                state = 'E';
+                            }
+                        } else {
+                            if (tEtage & pdata_t->appelPalierDescente_) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage >>= 1;
+                            pos--;
+                        }
+                        break;
+                    }
+
+/*
+PalierX 	= PalierD
+Direction 	= Montee
+dans ce cas on effectue une scrutation de la position courante jusqu'a l'appel 
+le plus bas si on rencontre un appel palierD on incremente le cout de Poids.
+*/                  
+                    case 'C': case 'c': {
+                         distance[pos] = cout;
+                         if ((tEtage == 1) || (pos == 0)) {
+                             state = 'E';
+                         } else {
+                             if (!verifBas_((me->appelExterneDescente_dplx \
+                                             | me->appelExterneDescente_dplx), tEtage)) {
+                                 for (i = pos - 1; i >= 0; i--) {
+                                     distance[i] = 0xFF;
+                                 }
+                                 state = 'E'; 
+                             } else {
+                                 if (tEtage & (pdata_t->appelPalierDescente_ \
+                                               | pdata_t->appelCabine_)) {
+                                     cout += POIDS;
+                                 } else {
+                                     cout++;
+                                 }
+                                 tEtage >>= 1;
+                                 pos--;
+                             }
+                         }
+                         break;
+                    }
+          
+                    default: {
+                        state = 'E';		/*..... fin de traitement .....*/
+                        break;
+                    }
+                }
+                if ((state == 'E') || (state == 'e')) {
+                    break;
+                }
+            }
+        } else { /*..... L'ascenseur est en descente	 .....*/
+            for (;;) {
+                switch (state) {
+/*
+PalierX 	= PalierD
+Direction 	= Descente
+dans ce cas on effectue une scrutation de la position courante et appel le plus bas
+si on rencontre un appel palierD on incremente le cout de Poids.
+*/                  
+                    case 'A': case 'a': {
+                        distance[pos] = cout;
+                        if ((!verifBas_((pdata_t->appelCabine_ \
+                                         | me->appelExterneMontee_dplx \
+                                         | me->appelExterneDescente_dplx), tEtage)) \
+                             || pos == 0) {
+                            if (tEtage & (pdata_t->appelCabine_ \
+                                          | pdata_t->appelPalierMontee_ \
+                                          | pdata_t->appelPalierDescente_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            if ((tEtage > 1) && ( pos > 0)) {
+                                for (i = pos - 1; i >= 0; i--) {
+                                    distance[i] = 0xFF;
+                                }
+                            }
+                            if (pos == currentPosition) {
+                                state = 'C';
+                            } else {
+                                state = 'B';
+                            }
+                            tEtage <<= 1;
+                            pos++;
+                        } else {
+                            if (tEtage & (pdata_t->appelPalierDescente_ \
+                                          | pdata_t->appelCabine_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage >>= 1;
+                            pos--;
+                        }
+                        break;
+                    }
+/*
+PalierX 	= PalierD
+Direction 	= Descente
+dans ce cas on effectue une scrutation de l'appel le plus bas et la position courante
+si on rencontre un appel palierM on incremente le cout de Poids.
+*/                  
+                    case 'B': case 'b': {
+                        if (!verifHaut_((pdata_t->appelCabine_ \
+                                         | me->appelExterneMontee_dplx \
+                                         | me->appelExterneDescente_dplx), tEtage) \
+                                       || (pos == posMax)) {
+                            for (i = (MAX_APPEL - 1); i > currentPosition; i--) {
+                                distance[i] = 0xFF;
+                            }
+                            state = 'E';
+                        } else {
+                            if (pos < currentPosition) {
+                                if (tEtage & pdata_t->appelPalierMontee_) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage <<= 1;
+                                pos++;
+                            } else {
+                                if (tEtage & (pdata_t->appelPalierMontee_ \
+                                          | pdata_t->appelCabine_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage <<= 1;
+                                pos++;
+                                state = 'C';
+                            } 
+                        }
+                        break;
+                    }
+
+/*
+PalierX 	= PalierD
+Direction 	= Descente
+dans ce cas on effectue une scrutation de la position courante et appel le plus haut
+si on rencontre un appel palierM ou Appel Cabine on incremente le cout de Poids.
+*/                        
+                    case 'C': case 'c': {
+                        if (!verifHaut_((pdata_t->appelCabine_ \
+                              | me->appelExterneMontee_dplx \
+                              | me->appelExterneDescente_dplx), \
+                            tEtage) || (pos == posMax)) {
+                            if ((tEtage == 1) || (pos == 0)) {
+                                state = 'E';
+                            } else {
+                                if (pos > (currentPosition + 1)) {
+                                    distance[pos] = cout;
+                                    if (tEtage & (pdata_t->appelPalierMontee_ \
+                                         | pdata_t->appelPalierDescente_ \
+                                         | pdata_t->appelCabine_)) {
+                                        cout += POIDS;
+                                    } else {
+                                        cout++;
+                                    }
+                                    tEtage >>= 1;
+                                    pos--;
+                                    state =  'D';
+                                } else {
+                                    distance[pos] = cout;
+                                    state = 'E';
+                                }
+                            }
+                        } else {
+                            if (tEtage & (pdata_t->appelCabine_ \
+                                 | pdata_t->appelPalierMontee_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage <<= 1;
+                            pos++;
+                        }
+                        break;
+                    }
+            
+/*
+PalierX 	= PalierD
+Direction 	= Descente
+dans ce cas on effectue une scrutation de l'appel le plus haut jusqu'a la position courante
+si on rencontre un appel palierM ou Appel Cabine on incremente le cout de Poids.
+*/                        
+		            case 'D': case 'd': {
+		                distance[pos] = cout;
+		                if(pos <= (currentPosition + 1)) {
+		                    state = 'E';
+		                } else {
+		    	            if (tEtage & pdata_t->appelPalierDescente_) {
+		    	                cout += POIDS;
+		    	            } else {
+		    	                cout++;
+		    	            }
+		                    tEtage >>= 1;
+		                    pos--;
+		                }
+		                break;            
+		            }
+      
+                    default: {
+                        state = 'E';                    // fin de traitement 
+                    }
+                }
+                if((state == 'E') || (state == 'e')) {
+                    break;
+                }
+            }
+        }
+    }  
+  
+
+/*
+*******************************************************************************
+***** 			PalierX == PalierM 					***************************
+*******************************************************************************
+*/
+    else {
+        if (pdata_t->direction_ == UP_) {
+            for (;;) { // L'ascenseur est en montee
+                switch (state) {
+/*
+PalierX 	= PalierM
+Direction 	= Montee
+dans ce cas on effectue une scrutation de la position courante jusqu'a l'appel le plus haut
+si on rencontre un appel cabine ou Palier Montee on incremente le cout de Poids sinon de cas, 
+une exception est faite si on est au dernier appel, dans ce cas on incremente de Poids si un 
+appel cabine ou palier Montee ou Descente
+*/      
+                    case 'A': case 'a': {
+                        distance[pos] = cout;
+                        if (!verifHaut_((pdata_t->appelCabine_ \
+                                         | me->appelExterneMontee_dplx \
+                                         | me->appelExterneDescente_dplx), tEtage) \
+                                        || (pos == posMax)){
+                            if ((tEtage == 1) || (pos == 0)) {
+                                for (i = (MAX_APPEL - 1); i >= 0; i--) {
+                                    distance[i] = 0xFF;
+                                }
+                                state = 'E';
+                            } else {
+                                if (tEtage & (pdata_t->appelCabine_ \
+                                     | pdata_t->appelPalierMontee_ \
+                                     | pdata_t->appelPalierDescente_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage >>= 1;
+                                pos--;
+                                if (pos == currentPosition) {
+                                    state = 'C';
+                                } else {
+                                    state = 'B';
+                                }
+                            }
+                        } else {
+                            if (tEtage & (pdata_t->appelCabine_ \
+                                  | pdata_t->appelPalierMontee_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage <<= 1;
+                            pos++;
+                        }
+                        break;
+                    }
+       
+/*
+PalierX 	= PalierM
+Direction 	= Montee
+dans ce cas on effectue une scrutation de l'etage le plus haut jusqu'a la position courante
+si on rencontre un appel palierD on incremente le cout de Poids.
+*/        
+                    case 'B': case 'b': {
+                        if (pos <= currentPosition) {
+                            if (pos) {
+                                if (tEtage & (pdata_t->appelCabine_ \
+                                     | pdata_t->appelPalierDescente_ \
+                                     | pdata_t->appelPalierMontee_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage >>= 1;
+                                pos--;
+                                state = 'C';
+                            } else {
+                                state = 'E';
+                            }
+                        } else {
+                            if (tEtage & pdata_t->appelPalierDescente_) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage >>= 1;
+                            pos--;
+                        }
+                        break;
+                    }
+
+/*
+PalierX 	= PalierM
+Direction 	= Montee
+dans ce cas on effectue une scrutation de la position courante 
+jusqu'a l'appel le plus bas si on rencontre un appel palierD on 
+incremente le cout de Poids.
+*/  
+                    case 'C': case 'c': {
+                        if ((tEtage == 1) || (pos == 0)) {
+                            if (pos == currentPosition) {
+                                state = 'E';
+                            } else {
+                                distance[pos] = cout;
+                                if (tEtage & (pdata_t->appelPalierDescente_ \
+                                     | pdata_t->appelPalierMontee_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                pos++;
+                                tEtage <<= 1;
+                                state = 'D';
+                            }
+                        } else {
+                            if (!verifBas_((pdata_t->appelCabine_ \
+                                 | me->appelExterneMontee_dplx \
+                                 | me->appelExterneDescente_dplx), tEtage)) {
+                                for (i = pos - 1; i >= 0; i--) {
+                                    distance[i] = 0xFF;
+                                }
+                                distance[pos] = cout;
+                                if (tEtage & (pdata_t->appelPalierDescente_ \
+                                     | pdata_t->appelPalierMontee_ \
+                                     | pdata_t->appelCabine_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage <<= 1;
+                                pos++;
+                                state = 'D'; 
+                            } else {
+                                if (tEtage & (pdata_t->appelCabine_ \
+                                     | pdata_t->appelPalierDescente_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage >>= 1;
+                                pos--;
+                            }
+                        }
+                        break;
+                    }
+/*
+PalierX 	= PalierM
+Direction 	= Montee
+dans ce cas on effectue une scrutation de la position courante jusqu'a l'appel le plus bas
+si on rencontre un appel palierD on incremente le cout de Poids.
+*/                  
+		            case 'D': case 'd': {
+		                distance[pos] = cout;
+		                if ((pos + 1) >= currentPosition) {
+		                    state = 'E';
+		                } else {
+		    	            if (tEtage & pdata_t->appelPalierMontee_) {
+		    	                cout += POIDS;
+		    	            } else {
+		    	                cout++;
+		    	            }
+		                    tEtage <<= 1;
+		                    pos++;
+		                }
+		                break;
+		            }
+          
+                    default: {
+                        state = 'E';		// fin de traitement   
+                    }
+                }
+                if ((state == 'E') || (state == 'e')) {
+                    break;
+                }
+            }
+        } else { // L'ascenseur est en descente
+            for (;;) {
+                switch (state) {
+/*
+PalierX 	= PalierM
+Direction 	= Descente
+dans ce cas on effectue une scrutation de la position courante et appel le plus bas
+si on rencontre un appel palierD ou appel Cabine on incremente le cout de Poids.
+*/                  
+                    case 'A': case 'a': {
+                        if (!verifBas_((pdata_t->appelCabine_ \
+                                        | me->appelExterneMontee_dplx \
+                                        | me->appelExterneDescente_dplx), tEtage)) {
+                            if (pos) {
+                                for (i = (pos - 1); i >= 0; i--) {
+                                    distance[i] = 0xFF;
+                                }
+                            }
+                            if (pos == currentPosition) {
+                                distance[pos] = cout;
+                                if(pos == posMax) {
+                                    state = 'E';
+                                } else {
+                                    if (tEtage & (pdata_t->appelPalierMontee_ \
+                                         | pdata_t->appelPalierDescente_ \
+                                         | pdata_t->appelCabine_)) {
+                                        cout += POIDS;
+                                    } else {
+                                        cout++;
+                                    }
+                                    tEtage <<= 1;
+                                    pos++;
+                                    state = 'C';
+                                }
+                            } else {
+                                distance[pos] = cout;
+                                if (tEtage & (pdata_t->appelPalierDescente_ \
+                                     | pdata_t->appelPalierMontee_ \
+                                     | pdata_t->appelCabine_)) {
+                                    cout += POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage <<= 1;
+                                pos++;
+                                state = 'B';
+                            }
+                        } else {
+                            if (tEtage & (pdata_t->appelCabine_ \
+                                 | pdata_t->appelPalierDescente_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage >>= 1;
+                            pos--;
+                        }
+                        break;
+                    }
+/*
+PalierX 	= PalierM
+Direction 	= Descente
+dans ce cas on effectue une scrutation de l'appel le plus bas et la position courante
+si on rencontre un appel palierM on incremente le cout de Poids.
+*/                  
+                    case 'B': case 'b': {
+                        distance[pos] = cout;
+                        if (!verifHaut_((pdata_t->appelCabine_ \
+                             | me->appelExterneMontee_dplx \
+                             | me->appelExterneDescente_dplx), tEtage) \
+                             || (pos == posMax)) {
+                            for (i = pos + 1; i <= posMax; i++) {
+                                distance[i] = 0xFF;
+                            }
+                            state = 'E';
+                        } else {
+                            if (pos >= currentPosition) {
+                                if (pos >= posMax) {
+                                    state = 'E';
+                                } else {
+                                    if (tEtage & pdata_t->appelPalierMontee_) {
+                                        cout += POIDS;
+                                    } else {
+                                        cout++;
+                                    }
+                                    pos++;
+                                    tEtage <<= 1;
+                                    state = 'C';
+                                }
+                            } else {
+                                if (tEtage & pdata_t->appelPalierMontee_) {
+                                    cout +=POIDS;
+                                } else {
+                                    cout++;
+                                }
+                                tEtage <<= 1;
+                                pos++;
+                            }
+                        }
+                        break;
+                    }
+
+/*
+PalierX 	= PalierM
+Direction 	= Descente
+dans ce cas on effectue une scrutation de la position courante et appel le plus haut
+si on rencontre un appel palierM on incremente le cout de Poids.
+*/                        
+                    case 'C': case 'c': {
+                        distance[pos] = cout;
+                        if (!verifHaut_(me->appelExterneMontee_dplx, tEtage) || (pos == posMax)) {
+                            for (i = pos + 1; i <= posMax; i++) {
+                                distance[i] = 0xFF;
+                            }
+                            state = 'E';
+                        } else {
+                            if (tEtage & (pdata_t->appelPalierMontee_ | pdata_t->appelCabine_)) {
+                                cout += POIDS;
+                            } else {
+                                cout++;
+                            }
+                            tEtage <<= 1;
+                            pos++;
+                        }
+                        break;
+                    }
+      
+                    default: {
+                        state = 'E';              // fin de traitement
+                        
+                    }
+                }
+                
+                if ((state == 'E') || (state == 'e')) {
+                    break;
+                }
+            }
+        }
+    }
+}
+  
+
+/*
+*******************************************************************************
+*  suivant les cout enregistres dans les deux tables cout
+*  on affecte les appels au moindre cout si egale on affecte a celui ayant le 
+*  plus faible ID
+*
+* version 1.0	25 / 03 / 2004
+*		le cas ou les tailles sont differentes n'est pas traite.
+*
+* 04 / 06 / 2006
+* appel = appelPalierMontee ou appelPalierDescente
+* 
+* 13 / 11 / 2007
+* le cas ou les deux ascenseurs sont decalés du bas est traité.
+* l'ascenseur ayant le niveau le plus bas a un index 0, l'autre a l'index egale
+* à la différence des deux niveaux.
+*******************************************************************************
+*/
+void affecterAppel (uint32_t *appel, 
+                   uint32_t appelExterne, 
+                   uint8_t *distanceA, 
+                   uint8_t *distanceB, 
+                   uint8_t tailleA, 
+                   uint8_t tailleB, 
+                   uint8_t l_id_A, 
+                   uint8_t l_id_B,
+                   uint8_t l_shift_A,
+                   uint8_t l_shift_B) {
+    uint32_t l_mask;
+    uint8_t  l_taille;
+    uint8_t  l_shift;
+    uint8_t  i;
+    
+    *appel = (uint32_t)0;
+    l_mask = (uint32_t)1;
+    /* on affecte automatiquement les appels les plus bas si l'ascenseur A est 
+                                                          decalé vers le bas */
+    if (l_shift_A < l_shift_B) {
+        for (i = (uint8_t)0; i < l_shift_B; i++) {
+            *appel |= (appelExterne & l_mask);
+            l_mask <<= 1;
+        }
+    } else if (l_shift_A > l_shift_B) {
+        for (i = (uint8_t)0; i < l_shift_A; i++) {
+            *appel &= ~l_mask;
+            l_mask <<= 1;
+        }
+    }
+
+    /* Nbre de niveaux de chaque ascenseur en supprimant le decalage vers la 
+                                                                         bas */
+  	l_shift  =  (l_shift_A > l_shift_B) ? l_shift_A : l_shift_B;
+  	tailleA  -= l_shift;
+  	tailleB  -= l_shift;
+  	l_taille =  (tailleA < tailleB) ? tailleA : tailleB;   
+
+  	for (i = 0; i < l_taille ; i++) {
+    	if (appelExterne & l_mask) {
+            if (distanceA[i + l_shift] == distanceB[i + l_shift]) {
+                if (l_id_A <= l_id_B) {
+                    *appel |= l_mask;
+                } else {
+                    *appel &= ~l_mask;
+                }
+            } else {
+                if (distanceA[i + l_shift] < distanceB[i + l_shift]) {
+                    *appel |= l_mask;
+                } else {
+                    *appel &= ~l_mask;
+                }
+            }
+    	}
+    	l_mask <<= 1;
+	}
+	                        
+  	if (tailleA > tailleB) {
+    	                  /* affecter automatiquement les etages superieures */
+    	*appel |= (appelExterne & (0xFFFFFFFF << (uint8_t)(tailleB + l_shift_A))); 
+  	}
+}
+
+
+/*...................... fonction de service ................................*/
+
+
+
+/*...................... test si il ya un probleme dans le triplex ..........*/
+int8_t getDuplexState(Duplex_t *me) {
+    if ((me->duplex_state == DUPLEX_OFF_) \
+         || ((me->dataAscenseur_B).phase_ == REVISION_) \
+         || ((me->dataAscenseur_B).phase_ == PATINAGE_)) {
+        return PB_IN_DUPLEX_;
+    }    
+    return NO_PB_IN_DUPLEX_; 
+}
+
+/*...................... vérification étage en haut .........................*/
+uint8_t verifHaut_(uint32_t appel, uint32_t pEtage) {
+    if ((~((pEtage - 1 ) + pEtage)) & appel) {
+        return (uint8_t)1;
+    }
+    return (uint8_t)0; 
+}
+
+/*...................... vérification étage en bas ..........................*/
+uint8_t verifBas_(uint32_t appel, uint32_t pEtage) {
+  if ((pEtage - 1) & appel) {
+      return (uint8_t)1;
+  }
+  return (uint8_t)0;
+}
+
+/*...................... scr_cancelCall .....................................*/
+void scr_cancelCall (Duplex_t *me) {
+    (me->call)->appelExterneMontee   &= (me->annulExterneMontee_dplx >> me->shift_A);
+    (me->call)->appelPMF[0]          &= (me->annulExterneMontee_dplx >> me->shift_A);
+    (me->call)->appelPMF[1]          &= (me->annulExterneMontee_dplx >> me->shift_A);
+    (me->call)->appelPMF[2]          &= (me->annulExterneMontee_dplx >> me->shift_A);
+    (me->call)->appelExterneDescente &= (me->annulExterneDescente_dplx >> me->shift_A);
+	
+//    if ((Parameters.nbreDeNiveaux.val <= NBRE_MAX_APPEL_COLLECTIF_MD_SS_EXT_) \
+//      && (Parameters.manoeuvrePalier == COLLECTIF_)) {
+//            (me->call)->appelPDF[0]          &= (me->annulExterneDescente_dplx >> me->shift_A) >> 1;
+//            (me->call)->appelPDF[1]          &= (me->annulExterneDescente_dplx >> me->shift_A) >> 1;
+//            (me->call)->appelPDF[2]          &= (me->annulExterneDescente_dplx >> me->shift_A) >> 1;
+//    } else {
+//            (me->call)->appelPDF[0]          &= (me->annulExterneDescente_dplx >> me->shift_A);
+//            (me->call)->appelPDF[1]          &= (me->annulExterneDescente_dplx >> me->shift_A);
+//            (me->call)->appelPDF[2]          &= (me->annulExterneDescente_dplx >> me->shift_A);
+//    }
+    // selective descent mode begin
+    (me->call)->appelPDF[0]          &= (me->annulExterneDescente_dplx >> me->shift_A);
+    (me->call)->appelPDF[1]          &= (me->annulExterneDescente_dplx >> me->shift_A);
+    (me->call)->appelPDF[2]          &= (me->annulExterneDescente_dplx >> me->shift_A); 
+    // selective descent mode end
+    me->annulExterneMontee_dplx          = (int32_t)-1;
+    me->annulExterneDescente_dplx        = (int32_t)-1;
+}
+                                       /*..... END DUPLEX STATE MACHINE .....*/
