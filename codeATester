@@ -3,16 +3,6 @@
 * File: duplex.c
 * Last Updated for Version: 0.1.00
 * Date of the Last Update:  December 22, 2014
-*
-*                    E L E C T R O N I C   I N N O V A T I O N
-*                    -----------------------------------------
-*                     innovating       embedded       systems
-*
-* Copyright (C) 2001-2014 Electronic Innovation, SARL. All rights reserved.
-*
-* Contact information:
-* Electronic Innovation Web site:  http://www.mejjad-electronics.com
-* e-mail:                          commercial@mejjad-electronics.com
 *****************************************************************************/
 #include "qpc.h"
 #include "qassert.h"
